@@ -1,5 +1,7 @@
+import os
 from transformers import (
     AutoTokenizer,
+    AutoModelForCausalLM,
     pipeline,
 )
 import torch
@@ -13,19 +15,33 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 
 class HFModel:
-    def __init__(self, name, new_tokens) -> None:
-        self.model = pipeline(
-            "text-generation",
-            model=name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True if "OLMo" in name else False,
-        )
-        if not self.model.tokenizer.pad_token_id:
-            self.model.tokenizer.pad_token_id = (
-                self.model.model.config.eos_token_id
+    def __init__(self, name, new_tokens, max_length=None, max_gen=None, use_max_gen=True, rank=0) -> None:
+        device = torch.device(f'cuda:{rank}')
+
+        if os.path.exists(name):
+            # Load model and tokenizer from local path
+            self.tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16).to("cuda")
+            self.local_model = True
+        else:
+            self.model = pipeline(
+                "text-generation",
+                model=name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True if "OLMo" in name else False,
             )
+            self.tokenizer = self.model.tokenizer
+            self.local_model = False
+            if not self.model.tokenizer.pad_token_id:
+                self.model.tokenizer.pad_token_id = (
+                    self.model.model.config.eos_token_id
+                )
         self.n_tokens = new_tokens
+        self.max_length = max_length
+        self.max_gen = max_gen
+        self.use_max_gen = use_max_gen
+        self.device = device
 
     def process(self, example, system_prompt=None):
         user_message = {"role": "user", "content": example}
@@ -39,20 +55,61 @@ class HFModel:
         )
 
     def generate_responses(self, dataset, batch_size, system_prompt=None):
-        dataset = list(map(lambda x: self.process(x, system_prompt), dataset))
+        # dataset = list(map(lambda x: self.process(x, system_prompt), dataset))
         responses = []
-        for response in tqdm(
-            self.model(
-                dataset,
-                batch_size=batch_size,
-                max_new_tokens=self.n_tokens,
-                do_sample=False,
-                num_beams=1,
-                return_full_text=False,
-            ),
-            total=len(dataset),
-        ):
-            responses.append(response[0]["generated_text"])
+        if self.local_model: #llama3 models
+            # Generate responses for local model
+            for batch_start in tqdm(range(0, len(dataset), batch_size), total=len(dataset)//batch_size):
+                batch = dataset[batch_start:batch_start + batch_size]
+                for prompt in batch:
+                    tokenized_prompt = self.tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+                    if len(tokenized_prompt) > self.max_length:
+                        half = int(self.max_length / 2)
+                        prompt = self.tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + \
+                                 self.tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+                    user_message = {"role": "user", "content": prompt}
+                    if system_prompt is None:
+                        messages = [user_message]
+                    else:
+                        system_message = {"role": "system", "content": system_prompt}
+                        messages = [system_message, user_message]
+                    # messages = [
+                    #     {"role": "user", "content": prompt},
+                    # ]
+                    input = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(self.device)
+                    context_length = input.shape[-1]
+                    
+                    if self.use_max_gen:
+                        output = self.model.generate(
+                            input,
+                            max_new_tokens=self.max_gen,
+                            num_beams=1,
+                            do_sample=False,
+                            temperature=1.0,
+                        )[0]
+                    else:
+                        output = self.model.generate(
+                            input,
+                            num_beams=1,
+                            do_sample=False,
+                            temperature=1.0,
+                        )[0]
+                    generated_text = self.tokenizer.decode(output[context_length:], skip_special_tokens=True)
+                    responses.append(generated_text)
+        else:
+            dataset = list(map(lambda x: self.process(x, system_prompt), dataset))
+            for response in tqdm(
+                self.model(
+                    dataset,
+                    batch_size=batch_size,
+                    max_new_tokens=self.n_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    return_full_text=False,
+                ),
+                total=len(dataset),
+            ):
+                responses.append(response[0]["generated_text"])
         return responses
 
 

@@ -205,6 +205,20 @@ if __name__ == "__main__":
         default="results",
         help="Directory for storing results",
     )
+
+    parser.add_argument(
+        "-max_length",
+        type=int,
+        default=16000,
+        help="Max input context length",
+    )
+
+    parser.add_argument(
+        "-max_gen",
+        type=int,
+        default=128,
+        help="Max new tokens to generate",
+    )
     args = parser.parse_args()
 
     system_prompt = (
@@ -218,7 +232,7 @@ if __name__ == "__main__":
     else:
         if args.token is not None:
             login(args.token)
-        model = HFModel(args.model, new_tokens=args.new_tokens)
+        model = HFModel(args.model, new_tokens=args.new_tokens, max_length=args.max_length, max_gen=args.max_gen)
 
     for dataset_name, filename in dataset_names.items():
         if args.dataset != "all" and dataset_name != args.dataset:
@@ -234,8 +248,13 @@ if __name__ == "__main__":
         print(filepath)
 
         # load dataset
-        with open(filepath, "r", encoding="utf-8") as infile:
-            data = json.load(infile)
+        try:
+            with open(filepath, "r", encoding="utf-8") as infile:
+                data = json.load(infile)
+            # Process the data as needed
+        except FileNotFoundError:
+            print(f"File {filepath} not found. Skipping.")
+            continue
         # set batch size
         if dataset_name in lower_batch_size:
             batch_size = max(1, args.batch_size // 2)
